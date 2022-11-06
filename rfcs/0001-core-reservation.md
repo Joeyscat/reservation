@@ -11,8 +11,6 @@ A core reservation service that solves the problem of reserving a resource for a
 
 We need a common solution for various reservation requirements: 1) calendar booking; 2) hotel/room booking; 3) meeting room booking; 4) parking lot booking: 5) etc. Repeatedly building features for these requirements is a waste of time and resources. We should have a common solution that can be used by all teams.
 
-Why are we doing this? What use cases does it support? What is the expected outcome?
-
 ## Guide-level explanation
 
 Basic architecture:
@@ -29,6 +27,13 @@ enum ReservationStatus {
     PENDING = 1;
     CONFIRMED = 2;
     BLOCKED = 3;
+}
+
+enum ReservationUpdateType {
+    UNKNOWN = 0;
+    CREATE = 1;
+    UPDATE = 2;
+    DELETE = 3;
 }
 
 message Reservation {
@@ -101,6 +106,8 @@ service ReservationService {
     rpc cancel(CancelRequest) returns (CancelResponse);
     rpc get(GetRequest) returns (GetResponse);
     rpc query(QueryRequest) returns (stream Reservation);
+    // another system could monitor newly added/conformed/cancelled reservations
+    rpc listen(ListenRequest) returns (stream Reservation);
 }
 ```
 
@@ -111,8 +118,8 @@ We use postgres as the database. Below is the schema:
 ```sql
 CREATE SCHEMA rsvp;
 
-CREATE TYPE rsvp.reservation_status AS ENUM('unknown','pending', 'coonfirmed', 'blocked')
-CREATE TYPE rsvp.reservation_update_type AS ENUM('unknown','create', 'update', 'delete')
+CREATE TYPE rsvp.reservation_status AS ENUM('unknown','pending', 'coonfirmed', 'blocked');
+CREATE TYPE rsvp.reservation_update_type AS ENUM('unknown','create', 'update', 'delete');
 
 CREATE TABLE rsvp.reservation (
     id uuid NOT NULL DEFAULT uuid_generate_v4(),
@@ -134,7 +141,7 @@ CREATE INDEX reservations_user_id_idx ON rsvp.reservations (user_id);
 -- if resource_id is NULL, find all reservations within during for the user
 -- if both are null, find all reservations within during
 -- if both set, find all reservations within during for the resource and user
-CREATE OR REPLACE FUNCTION rsvp.query(user_id TEXT, resource_id TEXT, during TSTZRANGE) RETURNS TABLE rsvp.reservations AS $$ $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION rsvp.query(uid TEXT, rid TEXT, during TSTZRANGE) RETURNS TABLE rsvp.reservations AS $$ $$ LANGUAGE plpgsql;
 
 -- reservation change queue
 CREATE TABLE rsvp.reservation_changes (
@@ -161,10 +168,47 @@ BEGIN
     -- notify a channel called reservation_update
     NOTIFY reservation_update;
     RETURN NULL;
-END
+END;
 $$ LANGUAGE plpgsql;
 
 CREATE TTRIGGER reservations_trigger
     AFTER INSERT OR UPDATE OR DELETE ON rsvp.reservations
     FOR EACH ROW EXECUTE rsvp.reservations_trigger();
 ```
+
+Here we use EXCLUDE constraint provided by postgres to ensure that on overlapping reservations cannot be made for a given resource at a given time.
+
+```sql
+CONSTRAINT reservations_conflict EXCLUDE USING gist (resource_id WITH =, timespan WITH &&)
+```
+
+![overlapping](images/overlapping.png)
+
+We also use a trigger to notify a channel when a reservation is added/updated/deleted. To make sure we missed certain messages from the channel when DB connection is down for some reason, we use a queue to store reservation changes. Thus when we receive a notification, we can query the queue to get all the changes since last time we checked, and once we finished processing all the changes, we can delete them from the queue.
+
+### Core flow
+
+![core flow](images/arch02.png)
+
+## Reference-level explanation
+
+TBD
+
+## Drawbacks
+
+N/A
+
+## Rationale and alternative
+
+N/A
+
+## Prior art
+
+N/A
+
+## Unresolved questions
+
+- how to handle repeated reservations? - is this more ore less a business logic which shouldn't be put into this layer? (non-goal: we consider this is a business logic and should be handled by the caller)
+- if load is big, we may use an external queue for recording changes.
+- we haven't considered tracking/observability/deployment yet.
+- query performance might be an issue - need to revisit the index and also consider using cache.
